@@ -25,6 +25,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+from codeledger_sandbox.policy import CommandPolicy
+
+
 # **核心作用**：自动查找宿主机上的 `docker` 可执行文件路径，解决 Docker 未加入系统 PATH 时无法直接调用的问题，实现开箱即用。
 
 # 采用**三级降级查找策略**，优先级从高到低：
@@ -113,10 +116,11 @@ class DockerSandbox:
         self,
         config: SandboxConfig | None = None,
         docker_bin: str | None = None,
+        policy: CommandPolicy | None = None,
     ) -> None:
         self.config = config or SandboxConfig()
         self.docker_bin = docker_bin or _resolve_docker_bin()
-
+        self.policy = policy or CommandPolicy()
 
     ### 4.2 核心方法：`run()`
 
@@ -131,6 +135,19 @@ class DockerSandbox:
         workspace_path = Path(workspace).resolve()
         if not workspace_path.is_dir():
             raise ValueError(f"workspace does not exist: {workspace_path}")
+
+
+        # 多了个命令校验  只有白名单里的命令才能进来(安全)
+        decision = self.policy.check(command)
+        if not decision.allowed:
+            return SandboxResult(
+                command=command,
+                exit_code=126,
+                stdout="",
+                stderr=f"command rejected: {decision.reason}",
+                timed_out=False,
+                container_name=None,
+            )
 
         # 步骤 2：生成唯一容器标识
         container_name = f"codeledger-{uuid.uuid4().hex[:12]}"
