@@ -1,0 +1,11 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "extraPaths": [
+    "packages/core/src",
+    "apps/api/src",
+    "packages/mcp/src",
+    "packages/sandbox/src"
+  ]
+}
