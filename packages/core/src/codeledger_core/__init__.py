@@ -7,6 +7,25 @@
 
 """CodeLedger core contracts and harness primitives."""
 
+# - 新增 errors 模块的顶层导入。
+# - 新增 tools 模块所有公开类型的顶层导入。
+# - 外部使用者只需要从 `codeledger_core` 顶层包就能导入所有需要的类型，不用深入内部子模块。
+from codeledger_core.errors import ToolError, ToolFailure, ToolFailureCategory
+from codeledger_core.tools import (
+    SandboxLike,
+    SearchMatch,
+    ToolRegistry,
+    ToolResult,
+    apply_patch,
+    git_diff,
+    read_file,
+    run_tests,
+    search_code,
+)
+
+
+
+
 # 这部分从 `codeledger_core.schemas`（内部专门放数据模型的模块）导入 13 个对象，按功能可分为三类：
 # 类型	包含对象	作用
 # 状态 / 分类枚举	RunStatus、StepStatus、FailureCategory、ToolRisk	定义运行、步骤、失败、风险的标准状态 / 分类值，保证全系统状态统一
@@ -45,6 +64,18 @@ __all__ = [
     "ToolCall",
     "ToolRisk",
     "utc_now",
+    "SandboxLike",
+    "SearchMatch",
+    "ToolError",
+    "ToolFailure",
+    "ToolFailureCategory",
+    "ToolRegistry",
+    "ToolResult",
+    "apply_patch",
+    "git_diff",
+    "read_file",
+    "run_tests",
+    "search_code",
 ]
 
 ## 三、这么写的设计好处

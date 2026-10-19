@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from codeledger_core.errors import ToolError, ToolFailure, ToolFailureCategory
 
 
 # - `MAX_FILE_BYTES`：单文件最大读取 1MB，防止大文件拖慢性能、避免读取二进制大文件。
@@ -42,11 +43,6 @@ class SandboxLike(Protocol):
         ...
 
 
-# 3. ToolError 异常
-# 工具层专属的运行时异常，用来区分「工具业务错误」和「系统异常」，比如路径越界、文件不存在、参数非法都抛出这个异常。
-class ToolError(RuntimeError):
-    """Raised when a tool cannot complete safely."""
-
 
 
 ## 二、标准数据结构
@@ -67,15 +63,19 @@ class SearchMatch:
 # - `ok`：布尔值，工具是否执行成功
 # - `output`：成功时的主输出文本
 # - `error`：失败时的错误信息
+# failure：真正导致失败的结构化错误。
+# warnings：不阻塞执行、但需要记录的问题，例如输出截断。
 # - `metadata`：附加结构化数据，比如匹配列表、行号信息、退出码等
 # > 设计价值：上层 Agent 处理所有工具都只用同一套逻辑：判断 `ok`，读 `output`，出错读 `error`，极大简化交互逻辑。
 
 @dataclass(frozen=True)
 class ToolResult:
-    ok:bool
-    output:str=""
-    error:str | None=None
-    metadata:dict[str,Any]=field(default_factory=dict)
+    ok: bool
+    output: str = ""
+    error: str | None = None
+    failure: ToolFailure | None = None
+    warnings: list[ToolFailure] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 
@@ -90,7 +90,10 @@ def _safe_path(workspace:str | Path,relative_path:str)->Path:
     root=Path(workspace).resolve()
     candidate=(root / relative_path).resolve()
     if candidate != root and root not in candidate.parents:
-        raise ToolError(f"path escapes workspace: {relative_path}")
+        raise ToolError(
+            f"path escapes workspace: {relative_path}",
+            category=ToolFailureCategory.PATH_ESCAPE,
+        )
     return candidate
 
 
@@ -159,16 +162,25 @@ def search_code(workspace,query,max_results=20,case_sensitive=False)->ToolResult
 # 读取指定文件的内容，支持按行号范围读取，输出自动带行号，方便 Agent 精确定位代码位置。
 def read_file(workspace:str | Path,path:str,start_line:int=1,end_line:int | None=None)->ToolResult:
     if start_line<1:
-        raise ToolError(f"file does not exist: {path}")
+        raise ToolError(
+            "start_line must be >= 1",
+            category=ToolFailureCategory.INVALID_ARGUMENT,
+        )
 
     target=_safe_path(workspace,path)
     if not target.is_file():
-        raise ToolError(f"file does not exist: {path}")
+        raise ToolError(
+            f"file does not exist: {path}",
+            category=ToolFailureCategory.INVALID_ARGUMENT,
+        )
 
     lines=target.read_text(encoding="utf-8",errors="replace").splitlines()
     last_line=end_line or len(lines)
     if last_line < start_line:
-        raise ToolError("end_line must be >= start_line")
+        raise ToolError(
+            "end_line must be >= start_line",
+            category=ToolFailureCategory.INVALID_ARGUMENT,
+        )
 
     selected=lines[start_line-1:last_line]
     # - `line_number:>4`：行号右对齐，占 4 个字符宽度，整齐美观
@@ -194,7 +206,10 @@ def read_file(workspace:str | Path,path:str,start_line:int=1,end_line:int | None
 # 精确修改文件中的某一段代码，是 Agent 修改代码的核心执行工具。
 def apply_patch(workspace,path,old_text,new_text)->ToolResult:
     if not old_text:
-        raise ToolError("old_text must not be empty")
+        raise ToolError(
+            "old_text must not be empty",
+            category=ToolFailureCategory.INVALID_ARGUMENT,
+        )
 
     target = _safe_path(workspace, path)
     if not target.is_file():
@@ -207,9 +222,9 @@ def apply_patch(workspace,path,old_text,new_text)->ToolResult:
     # > 设计目的：保证每次修改都是精准、唯一的，防止出现替换错位置、批量误替换的问题。
     if occurrences !=1:
         raise ToolError(
-            f"expected exactly one occurrence of old_text, found {occurrences}"
+            f"expected exactly one occurrence of old_text, found {occurrences}",
+            category=ToolFailureCategory.INVALID_ARGUMENT,
         )
-
     #执行替换，第三个参数 `1` 表示只替换第 1 处匹配。
     updated=original.replace(old_text,new_text,1)
 
@@ -261,16 +276,33 @@ def git_diff(workspace)->ToolResult:
     )
     # 命令执行失败（退出码非 0），返回标准错误结果，附带错误信息和退出码。
     if proc.returncode != 0:
+        message = proc.stderr.strip() or "git diff failed"
         return ToolResult(
             ok=False,
-            error=proc.stderr.strip() or "git diff failed",
+            error=message,
+            failure=ToolFailure(
+                category=ToolFailureCategory.NON_ZERO_EXIT,
+                message=message,
+                details={"returncode": proc.returncode},
+            ),
             metadata={"returncode": proc.returncode},
         )
+
     return ToolResult(
         ok=True,
         output=proc.stdout,
         metadata={"returncode": proc.returncode},
     )
+
+
+MAX_TOOL_OUTPUT_CHARS = 20_000
+
+# `_truncate_output`：限制输出文本长度，防止超大日志撑爆追踪系统与前端上下文，超过限制自动截断并标记。
+# _truncate_output：防止巨大测试日志撑爆 trace/UI。
+def _truncate_output(value: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> tuple[str, bool]:
+    if len(value) <= limit:
+        return value, False
+    return value[:limit] + "\n...[truncated]", True
 
 
 # 5. run_tests — 沙箱内执行测试
@@ -283,17 +315,70 @@ def git_diff(workspace)->ToolResult:
 # - 元数据里附带完整的执行信息，方便上层排查问题。
 def run_tests(sandbox:SandboxLike,workspace:str | Path,command:str="pytest -q")->ToolResult:
     result=sandbox.run(command,workspace)
-    ok=result.exit_code==0 and not result.timed_out
+    stdout,stdout_truncated=_truncate_output(result.stdout)
+    stderr,stderr_truncated=_truncate_output(result.stderr)
+
+    warnings:list[ToolFailure]=[]
+    if stdout_truncated:
+        warnings.append(
+            ToolFailure(
+                category=ToolFailureCategory.OUTPUT_TRUNCATED,
+                message="stdout was truncated",
+                details={"limit":MAX_TOOL_OUTPUT_CHARS,"stream":"stdout"}
+            )
+        )
+    if stderr_truncated:
+        warnings.append(
+            ToolFailure(
+                category=ToolFailureCategory.OUTPUT_TRUNCATED,
+                message="stderr was truncated",
+                details={"limit": MAX_TOOL_OUTPUT_CHARS, "stream": "stderr"},
+            )
+        )
+
+    failure:ToolFailure | None=None
+    if result.timed_out:
+        failure=ToolFailure(
+            category=ToolFailureCategory.TIMEOUT,
+            message="sandbox command timed out",
+            retryable=True,
+            details={"command":command,"container_name":result.container_name},
+        )
+    elif result.exit_code!=0:
+        lower_stderr=result.stderr.lower()
+        permission_denied = any(
+            marker in lower_stderr
+            for marker in ("permission denied", "access is denied", "eacces")
+        )
+        category=(
+            ToolFailureCategory.PERMISSION_DENIED
+            if permission_denied
+            else ToolFailureCategory.NON_ZERO_EXIT
+        )
+        failure=ToolFailure(
+            category=category,
+            message=stderr.strip() or f"command exited with {result.exit_code}",
+            retryable=not permission_denied,
+            details={
+                "command":command,
+                "exit_code":result.exit_code,
+                "container_name":result.container_name,
+            }
+        )
 
     return ToolResult(
-        ok=ok,
-        output=result.stdout,
-        error=None if ok else result.stderr,
+        ok=failure is None,
+        output=stdout,
+        error=stderr if failure else None,
+        failure=failure,
+        warnings=warnings,
         metadata={
             "command": command,
             "exit_code": result.exit_code,
             "timed_out": result.timed_out,
             "container_name": result.container_name,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         },
     )
 
@@ -325,10 +410,22 @@ class ToolRegistry:
         if handler is None:
             return ToolResult(ok=False,error=f"unknown tool: {name}")
 
+        # - 第一层捕获 `ToolError`（已知业务异常）：直接把异常携带的 `failure` 放进结果里返回。
+        # - 第二层捕获所有其他异常（未知异常）：封装成 `UNKNOWN` 类型的 `ToolFailure` 返回。
+        # - 最终效果：**所有异常都不会抛出注册器**，全部封装成标准 `ToolResult` 返回。上层 Agent 永远只用处理 `ToolResult` 一种结构，不用写 try-except。
         try:
             return handler(**kwargs)
+        except ToolError as exc:
+            return ToolResult(ok=False, error=str(exc), failure=exc.failure)
         except Exception as exc:
-            return ToolResult(ok=False,error=str(exc))
+            return ToolResult(
+                ok=False,
+                error=str(exc),
+                failure=ToolFailure(
+                    category=ToolFailureCategory.UNKNOWN,
+                    message=str(exc),
+                ),
+            )
 
     
 __all__ = [
@@ -342,6 +439,9 @@ __all__ = [
     "read_file",
     "run_tests",
     "search_code",
+    "MAX_TOOL_OUTPUT_CHARS",
+    "ToolFailure",
+    "ToolFailureCategory",
 ]
 
 
