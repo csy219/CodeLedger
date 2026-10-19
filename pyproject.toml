@@ -33,6 +33,7 @@ where = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest_tmp"
 cache_dir = ".cache/pytest"
 pythonpath = [
   "apps/api/src",
