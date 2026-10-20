@@ -31,6 +31,12 @@ from codeledger_core.trace import (
     TracedToolRegistry,
 )
 
+#构建仓库地图(仓库全部内容进来会打爆上下文)
+from codeledger_core.repo_map import (
+    RepoFile,
+    RepoMap,
+    RepoMapBuilder,
+)
 
 
 # 这部分从 `codeledger_core.schemas`（内部专门放数据模型的模块）导入 13 个对象，按功能可分为三类：
@@ -87,6 +93,9 @@ __all__ = [
     "TraceEventType",
     "TraceRecorder",
     "TracedToolRegistry",
+    "RepoFile",
+    "RepoMap",
+    "RepoMapBuilder",
 ]
 
 ## 三、这么写的设计好处
