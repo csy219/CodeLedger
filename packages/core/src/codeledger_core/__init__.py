@@ -23,6 +23,13 @@ from codeledger_core.tools import (
     search_code,
 )
 
+# 作用：把追踪模块的核心类型提升到包顶层，外部使用者不用深入子模块，直接从 `codeledger_core` 顶层导入即可。
+from codeledger_core.trace import (
+    TraceEvent,
+    TraceEventType,
+    TraceRecorder,
+    TracedToolRegistry,
+)
 
 
 
@@ -76,6 +83,10 @@ __all__ = [
     "read_file",
     "run_tests",
     "search_code",
+    "TraceEvent",
+    "TraceEventType",
+    "TraceRecorder",
+    "TracedToolRegistry",
 ]
 
 ## 三、这么写的设计好处
