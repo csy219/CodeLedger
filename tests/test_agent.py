@@ -11,6 +11,8 @@ from codeledger_core.tools import ToolResult
 from codeledger_core.trace import TraceEventType, TraceRecorder
 
 
+from codeledger_core.agent import StopReason
+
 class FakeRegistry:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -102,3 +104,66 @@ def test_agent_loop_records_trace(tmp_path) -> None:
     assert TraceEventType.TOOL_CALL_STARTED in event_types
     assert TraceEventType.TOOL_CALL_FINISHED in event_types
     assert TraceEventType.RUN_FINISHED in event_types
+
+
+
+
+def test_agent_token_budget(tmp_path) -> None:
+    policy = ScriptedPolicy(
+        [
+            AgentAction(
+                action=ActionType.SEARCH_CODE,
+                arguments={"query": "hello"},
+                tokens=60,
+            )
+        ]
+    )
+
+    result = AgentLoop(
+        AgentConfig(max_steps=5, max_tokens=50)
+    ).run(
+        task="token budget",
+        workspace=tmp_path,
+        policy=policy,
+        registry=FakeRegistry(),
+    )
+
+    assert not result.success
+    assert result.stop_reason == StopReason.MAX_TOKENS
+    assert result.tokens_used == 60
+
+
+def test_agent_repeated_action(tmp_path) -> None:
+    action = AgentAction(
+        action=ActionType.SEARCH_CODE,
+        arguments={"query": "same"},
+    )
+    policy = ScriptedPolicy([action, action, action])
+
+    result = AgentLoop(
+        AgentConfig(max_steps=5, max_repeated_actions=1)
+    ).run(
+        task="repeat",
+        workspace=tmp_path,
+        policy=policy,
+        registry=FakeRegistry(),
+    )
+
+    assert not result.success
+    assert result.stop_reason == StopReason.REPEATED_ACTION
+
+
+def test_agent_time_budget(tmp_path) -> None:
+    policy = ScriptedPolicy([])
+
+    result = AgentLoop(
+        AgentConfig(max_steps=5, max_wall_time_seconds=0)
+    ).run(
+        task="timeout",
+        workspace=tmp_path,
+        policy=policy,
+        registry=FakeRegistry(),
+    )
+
+    assert not result.success
+    assert result.stop_reason == StopReason.TIME_LIMIT

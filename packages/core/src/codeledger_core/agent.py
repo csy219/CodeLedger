@@ -37,6 +37,22 @@ from codeledger_core.trace import (
     ToolRegistryLike,
 )
 
+import json
+from pydantic import Field
+
+
+# 二、新增停止原因枚举 StopReason
+class StopReason(StrEnum):
+    FINISHED = "finished"
+    FAILED = "failed"
+    MAX_STEPS = "max_steps"
+    MAX_TOOL_CALLS = "max_tool_calls"
+    MAX_TOKENS = "max_tokens"
+    TIME_LIMIT = "time_limit"
+    REPEATED_ACTION = "repeated_action"
+    ERROR = "error"
+
+
 
 # 段 2：动作类型枚举 `ActionType`
 # - 继承 `StrEnum`，值本身就是字符串，和工具注册器的工具名一一对应，直接可以用来调用工具。
@@ -63,10 +79,23 @@ class ActionType(StrEnum):
 
 # > 这是 Policy 输出的标准格式，也是循环和策略之间的数据契约。无论策略是脚本还是大模型，输出都必须符合这个结构。
 class AgentAction(BaseContract):
-    action:ActionType
-    arguments:dict={}
-    reason: str | None = None
+    action: ActionType
 
+    # `arguments: dict = Field(default_factory=dict)`：用 `default_factory=dict` 替代原有的 `{}` 默认值，每个实例都会生成独立的字典，避免可变默认值的副作用
+    arguments: dict = Field(default_factory=dict)
+    reason: str | None = None
+    # `tokens: int = 0`：新增 token 消耗字段，记录本次决策消耗的 token 数量。脚本策略下默认为 0，后续接入 LLM 策略时会填入真实的 token 消耗，用于累计预算控制。
+    tokens: int = 0
+
+    # - `signature()` 方法：生成动作的稳定指纹字符串，用于重复动作检测。
+    # - 格式为「动作名：排序后的参数字典 JSON」，`sort_keys=True` 保证参数键顺序不同但内容相同的动作，指纹完全一致，不会因为键的顺序不同被误判为不同动作。
+    # - `default=str` 兜底，遇到不可序列化的类型也能转成字符串，不会抛出异常。
+    # > 核心作用：用来判断 Agent 是否在反复执行完全相同的操作，比如反复读同一个文件、反复搜同一个关键词，出现卡壳时及时终止，避免浪费时间和成本。
+    def signature(self) -> str:
+        return (
+            f"{self.action.value}:"
+            f"{json.dumps(self.arguments, sort_keys=True, default=str)}"
+        )
 
 # 段 4：运行配置类 `AgentConfig`
 # - 冻结数据类，配置不可篡改，保证运行过程中预算规则不被改动。
@@ -76,8 +105,12 @@ class AgentAction(BaseContract):
 # > 这是 W2-3 预算控制的基础，两个维度双重限流，是 Agent 安全运行的重要保障。
 @dataclass(frozen=True)
 class AgentConfig:
-    max_steps:int=20
-    max_tool_calls:int=20
+    max_steps: int = 20
+    max_tool_calls: int = 20
+    max_tokens: int = 100_000
+    max_wall_time_seconds: float = 600.0
+    max_repeated_actions: int = 2
+
 
 
 # 段 5：运行结果类 `AgentRunResult`
@@ -88,16 +121,22 @@ class AgentConfig:
 # - `tool_calls: int`：实际调用工具的总次数。
 # - `trace_id: str | None = None`：对应的追踪链路 ID，开启追踪时填充，方便回溯完整运行过程。
 # - `error: str | None = None`：失败时的错误原因。
+# 新增 `tokens_used: int = 0`：任务累计消耗的 token 总数。
+# 新增 `elapsed_ms: int = 0`：任务总耗时，单位毫秒。
+# 新增 `stop_reason: StopReason | None = None`：结构化停止原因，所有退出场景都会填充对应的枚举值，成功失败都有明确标识。
 
-# > 设计价值：所有退出场景（正常完成、主动失败、步数超限、异常）都返回统一结构，上层不用分别处理不同的返回格式。
+# 设计价值：返回结果从「成功 / 失败 + 错误信息」升级为「结构化的全量统计信息」，上层可以直接拿到成本、耗时、停止原因，用于统计、对账、效果评估。
 @dataclass(frozen=True)
 class AgentRunResult:
-    success:bool
-    final_output:str
-    steps:int
-    tool_calls:int
-    trace_id:str | None = None
-    error:str | None = None
+    success: bool
+    final_output: str
+    steps: int
+    tool_calls: int
+    trace_id: str | None = None
+    error: str | None = None
+    tokens_used: int = 0
+    elapsed_ms: int = 0
+    stop_reason: StopReason | None = None
 
 
 # 段 6：策略协议 `Policy`
@@ -160,6 +199,14 @@ class AgentLoop:
         registry:ToolRegistryLike,
         trace:TraceRecorder | None = None,
     )->AgentRunResult:
+        # - `started_at = time.perf_counter()`：记录任务开始的高精度时间戳，用于计算总耗时和时间预算检查。
+        # - `tokens_used = 0`：初始化累计 token 消耗计数器。
+        # - `action_counts: dict[str, int] = {}`：初始化动作次数字典，key 是动作指纹，value 是出现次数，用于重复动作检测。
+        started_at = time.perf_counter()
+        tokens_used = 0
+        action_counts: dict[str, int] = {}
+
+        
         # 第一步：解析工作目录绝对路径。
         workspace_path=Path(workspace).resolve()
         # 第二步：生成仓库地图，作为 Agent 的初始观察信息。Agent 第一眼看到的就是仓库结构，而不是全部代码，符合人类排查问题的逻辑。
@@ -194,6 +241,28 @@ class AgentLoop:
             while steps < self.config.max_steps:
                 steps+=1
 
+                # 6.2 每轮循环开头：时间预算检查
+                elapsed=time.perf_counter()-started_at
+                if elapsed >=self.config.max_wall_time_seconds:
+                    reason="wall time limit reached"
+                    if trace:
+                        trace.record(
+                            TraceEventType.ERROR,
+                            step_index=steps,
+                            error=reason,
+                        )
+                    return AgentRunResult(
+                        success=False,
+                        final_output="",
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        trace_id=trace.trace_id if trace else None,
+                        error=reason,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int(elapsed*1000),
+                        stop_reason=StopReason.TIME_LIMIT,
+                    )
+
                 if trace:
                     trace.record(
                         TraceEventType.STEP_STARTED,
@@ -201,6 +270,58 @@ class AgentLoop:
                     )
 
                 action=policy.decide(task,observation,history)
+                # 6.3 决策后：token 预算 + 重复动作检查
+                # - 先把本次决策的 token 消耗累加到总计数器。
+                # - 超过上限则立刻终止，停止原因标记为 `MAX_TOKENS`。
+                # - 返回结果里带上累计 token 数和当前耗时。
+                tokens_used+=action.tokens
+                if tokens_used > self.config.max_tokens:
+                    reason="max tokens reached"
+                    if trace:
+                        trace.record(
+                            TraceEventType.ERROR,
+                            step_index=steps,
+                            error=reason,
+                        )
+                    return AgentRunResult(
+                        success=False,
+                        final_output="",
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        trace_id=trace.trace_id if trace else None,
+                        error=reason,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                        stop_reason=StopReason.MAX_TOKENS,
+                    )
+
+                # 重复动作检查
+                # - 生成当前动作的指纹。
+                # - 在计数字典里对应计数 +1。
+                # - 如果超过最大重复次数，立刻终止，停止原因标记为 `REPEATED_ACTION`。
+                # 设计作用：Agent 有时候会陷入「读文件 → 没看懂 → 再读一遍」的死循环，重复动作检测能及时终止这种无意义的循环，避免浪费时间和成本。
+                signature=action.signature()
+                action_counts[signature]=action_counts.get(signature,0)+1
+
+                if action_counts[signature] > self.config.max_repeated_actions:
+                    reason = "repeated action limit reached"
+                    if trace:
+                        trace.record(
+                            TraceEventType.ERROR,
+                            step_index=steps,
+                            error=reason,
+                        )
+                    return AgentRunResult(
+                        success=False,
+                        final_output="",
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        trace_id=trace.trace_id if trace else None,
+                        error=reason,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                        stop_reason=StopReason.REPEATED_ACTION,
+                    )
 
                 # 8.4 终止动作判断：FINISH
                 if action.action==ActionType.FINISH:
@@ -218,6 +339,10 @@ class AgentLoop:
                         steps=steps,
                         tool_calls=tool_calls,
                         trace_id=trace.trace_id if trace else None,
+                        error=None,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int((time.perf_counter()-started_at)*1000),
+                        stop_reason=StopReason.FINISHED,
                     )
 
                 # 8.5 终止动作判断：FAIL
@@ -236,6 +361,9 @@ class AgentLoop:
                         tool_calls=tool_calls,
                         trace_id=trace.trace_id if trace else None,
                         error=reason,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                        stop_reason=StopReason.FAILED
                     )
 
                 # 8.6 工具调用数超限判断
@@ -257,6 +385,9 @@ class AgentLoop:
                         tool_calls=tool_calls,
                         trace_id=trace.trace_id if trace else None,
                         error=reason,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                        stop_reason=StopReason.MAX_TOOL_CALLS,                    
                     )
 
                 # 8.7 执行工具调用
@@ -308,6 +439,9 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 trace_id=trace.trace_id if trace else None,
                 error=reason,
+                tokens_used=tokens_used,
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                stop_reason=StopReason.MAX_STEPS,
             )
         # 8.11 全局异常捕获
         # - 捕获循环过程中所有未处理的异常，保证 Agent 不会崩溃。
@@ -329,6 +463,9 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 trace_id=trace.trace_id if trace else None,
                 error=str(exc),
+                tokens_used=tokens_used,
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                stop_reason=StopReason.ERROR
             )
                 
 
