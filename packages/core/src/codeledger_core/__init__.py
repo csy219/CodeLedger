@@ -39,6 +39,17 @@ from codeledger_core.repo_map import (
 )
 
 
+# 单Agent-loop
+from codeledger_core.agent import (
+    ActionType,
+    AgentAction,
+    AgentConfig,
+    AgentLoop,
+    AgentRunResult,
+    Policy,
+    ScriptedPolicy,
+)
+
 # 这部分从 `codeledger_core.schemas`（内部专门放数据模型的模块）导入 13 个对象，按功能可分为三类：
 # 类型	包含对象	作用
 # 状态 / 分类枚举	RunStatus、StepStatus、FailureCategory、ToolRisk	定义运行、步骤、失败、风险的标准状态 / 分类值，保证全系统状态统一
@@ -96,6 +107,13 @@ __all__ = [
     "RepoFile",
     "RepoMap",
     "RepoMapBuilder",
+    "ActionType",
+    "AgentAction",
+    "AgentConfig",
+    "AgentLoop",
+    "AgentRunResult",
+    "Policy",
+    "ScriptedPolicy",
 ]
 
 ## 三、这么写的设计好处
