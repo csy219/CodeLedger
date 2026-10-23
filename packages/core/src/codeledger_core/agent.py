@@ -19,6 +19,11 @@
 # - 可测试性：不依赖真实模型、不依赖真实沙箱，纯单元测试就能覆盖所有核心路径
 
 
+# W2-4 是在 Agent 主循环基础上新增的**自动故障恢复机制**，解决的核心痛点是：原来工具执行失败（比如测试跑挂、补丁打不上）后，需要 Policy 额外花一步决策去重新定位问题，既浪费步数、又消耗 token，属于低价值的重复决策。
+
+# 本次升级加入 `RecoveryPlanner` 恢复规划器，在工具执行失败后，**自动执行一步定位动作**（提取错误里的文件路径并读取、搜索失败关键词、重读目标文件），把恢复后的最新观察信息再交给 Policy 继续决策，不用消耗 Policy 的决策轮次，提升修复效率。同时新增修复次数上限，防止无限重试陷入死循环。
+
+
 from __future__ import annotations
 import time
 import uuid
@@ -40,6 +45,10 @@ from codeledger_core.trace import (
 import json
 from pydantic import Field
 
+# 新增正则表达式模块导入，用于从测试失败的错误输出中提取 Python 文件路径，是恢复规划器提取错误信息的核心依赖。
+import re
+
+
 
 # 二、新增停止原因枚举 StopReason
 class StopReason(StrEnum):
@@ -51,6 +60,7 @@ class StopReason(StrEnum):
     TIME_LIMIT = "time_limit"
     REPEATED_ACTION = "repeated_action"
     ERROR = "error"
+    REPAIR_ATTEMPTS_EXCEEDED = "repair_attempts_exceeded"
 
 
 
@@ -101,6 +111,7 @@ class AgentAction(BaseContract):
 # - 冻结数据类，配置不可篡改，保证运行过程中预算规则不被改动。
 # - `max_steps: int = 20`：最大步数，默认 20 步。每一轮决策 + 行动算一步，防止无限循环。
 # - `max_tool_calls: int = 20`：最大工具调用次数，默认 20 次。单独统计工具调用，防止单步内多次调用工具、成本失控。
+# 新增 `max_repair_attempts` 字段，默认值 2，即最多允许自动恢复 2 次。作用：限制自动恢复的次数，防止工具反复失败、恢复动作反复执行，陷入死循环消耗资源。
 
 # > 这是 W2-3 预算控制的基础，两个维度双重限流，是 Agent 安全运行的重要保障。
 @dataclass(frozen=True)
@@ -110,6 +121,7 @@ class AgentConfig:
     max_tokens: int = 100_000
     max_wall_time_seconds: float = 600.0
     max_repeated_actions: int = 2
+    max_repair_attempts:int=2
 
 
 
@@ -137,6 +149,7 @@ class AgentRunResult:
     tokens_used: int = 0
     elapsed_ms: int = 0
     stop_reason: StopReason | None = None
+    repair_attempts: int = 0
 
 
 # 段 6：策略协议 `Policy`
@@ -184,10 +197,53 @@ class ScriptedPolicy:
         return action
 
 
+# 五、核心新增：RecoveryPlanner 恢复规划器
+# 这是 W2-4 的核心新增类，负责根据失败的动作和结果，生成对应的恢复动作。
+class RecoveryPlanner:
+    def plan(
+        self,
+        failed_action:AgentAction,
+        result:ToolResult,
+    )->AgentAction | None:
+        text=f"{result.error or ''}\n{result.output or ''}"
+        # - 针对 `RUN_TESTS` 测试失败的场景，做两级恢复策略：
+        # 1. **优先精准定位**：用正则从错误输出里匹配 `.py` 文件路径，匹配成功就直接生成「读取该文件」的恢复动作，让 Agent 直接看到报错的文件内容。
+        # 2. **降级模糊搜索**：提取不到文件路径时，生成「搜索 FAILED 关键词」的恢复动作，全局定位失败相关代码。
+        # - 都附带 `reason` 字段，说明恢复动作的原因，方便 trace 追溯。
+        if failed_action.action==ActionType.RUN_TESTS:
+            match=re.search(r"([A-Za-z0-9_./\\-]+\.py)",text)
+            if match:
+                return AgentAction(
+                    action=ActionType.READ_FILE,
+                    arguments={"path":match.group(1)},
+                    reason="test failed; re-localize failing file",
+                )
+            return AgentAction(
+                action=ActionType.SEARCH_CODE,
+                arguments={"query":"FAILED"},
+                reason="test failed; search failure-related code"
+            )
+        # - 针对 `APPLY_PATCH` 补丁应用失败的场景：直接从失败动作的参数里取出目标文件路径，生成「重读目标文件」的恢复动作。
+        # - 补丁失败通常是因为文件内容和预期不一致，重读最新内容可以让 Policy 拿到准确的上下文重新生成补丁。
+        if failed_action.action==ActionType.APPLY_PATCH:
+            path=failed_action.arguments.get("path")
+            if path:
+                return AgentAction(
+                    action=ActionType.READ_FILE,
+                    arguments={"path":path},
+                    reason="patch failed; re-read target file"
+                )
+
+        # 其他类型的工具失败（比如搜索、读文件、git diff），没有预设的恢复策略，返回 None 表示无法自动恢复。
+        return None
+        
+
+
 # 段 8：核心循环类 `AgentLoop`
 class AgentLoop:
-    def __init__(self,config:AgentConfig | None = None)->None:
+    def __init__(self,config:AgentConfig | None = None,recovery: RecoveryPlanner | None = None,)->None:
         self.config=config or AgentConfig()
+        self.recovery=recovery or RecoveryPlanner()
 
     # 8.2 核心运行方法 `run()` — 初始化阶段
     # 方法入参：任务描述、工作目录、策略实例、工具注册器、可选追踪器。
@@ -219,10 +275,13 @@ class AgentLoop:
         # steps：步数计数器
         # tool_calls：工具调用计数器
         # tools：如果传了追踪器，就把工具注册器包装成带自动埋点的版本；否则直接用原注册器，零侵入
+        # 初始化修复次数计数器为 0，每次触发自动恢复就累加 1，用于和上限比对。
         history:list[str]=[]
         steps=0
         tool_calls=0
         tools=TracedToolRegistry(registry,trace) if trace else registry
+        repair_attempts = 0
+
         
         #  第五步：开启追踪的话，记录「任务开始」事件。
         if trace:
@@ -261,6 +320,7 @@ class AgentLoop:
                         tokens_used=tokens_used,
                         elapsed_ms=int(elapsed*1000),
                         stop_reason=StopReason.TIME_LIMIT,
+                        repair_attempts=repair_attempts
                     )
 
                 if trace:
@@ -293,6 +353,7 @@ class AgentLoop:
                         tokens_used=tokens_used,
                         elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                         stop_reason=StopReason.MAX_TOKENS,
+                        repair_attempts=repair_attempts
                     )
 
                 # 重复动作检查
@@ -321,6 +382,7 @@ class AgentLoop:
                         tokens_used=tokens_used,
                         elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                         stop_reason=StopReason.REPEATED_ACTION,
+                        repair_attempts=repair_attempts
                     )
 
                 # 8.4 终止动作判断：FINISH
@@ -343,6 +405,7 @@ class AgentLoop:
                         tokens_used=tokens_used,
                         elapsed_ms=int((time.perf_counter()-started_at)*1000),
                         stop_reason=StopReason.FINISHED,
+                        repair_attempts=repair_attempts
                     )
 
                 # 8.5 终止动作判断：FAIL
@@ -363,7 +426,8 @@ class AgentLoop:
                         error=reason,
                         tokens_used=tokens_used,
                         elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                        stop_reason=StopReason.FAILED
+                        stop_reason=StopReason.FAILED,
+                        repair_attempts=repair_attempts
                     )
 
                 # 8.6 工具调用数超限判断
@@ -387,7 +451,8 @@ class AgentLoop:
                         error=reason,
                         tokens_used=tokens_used,
                         elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                        stop_reason=StopReason.MAX_TOOL_CALLS,                    
+                        stop_reason=StopReason.MAX_TOOL_CALLS,     
+                        repair_attempts=repair_attempts               
                     )
 
                 # 8.7 执行工具调用
@@ -423,6 +488,87 @@ class AgentLoop:
                             "ok": result.ok,
                         },
                     )
+                # 八、核心改动：工具执行后的自动恢复逻辑
+                # 先判断工具执行是否失败。只有失败才会进入恢复流程，成功直接进入下一轮决策。
+                if not result.ok:
+                    # 修复次数计数器 +1，注意：**一次工具失败对应一次恢复尝试**，不管恢复动作本身成功还是失败。
+                    repair_attempts+=1
+
+                    # - 检查修复次数是否超过配置上限。
+                    # - 超限则直接终止任务，记录错误追踪事件，返回标准化失败结果，停止原因为 `REPAIR_ATTEMPTS_EXCEEDED`。
+                    # - 这是防止无限恢复的安全闸门，避免工具反复失败、恢复动作无限执行。
+                    if repair_attempts > self.config.max_repair_attempts:
+                        reason = "repair attempts exceeded"
+                        if trace:
+                            trace.record(
+                                TraceEventType.ERROR,
+                                step_index=steps,
+                                error=reason,
+                            )
+                        return AgentRunResult(
+                            success=False,
+                            final_output="",
+                            steps=steps,
+                            tool_calls=tool_calls,
+                            trace_id=trace.trace_id if trace else None,
+                            error=reason,
+                            tokens_used=tokens_used,
+                            elapsed_ms=int(
+                                (time.perf_counter() - started_at) * 1000
+                            ),
+                            stop_reason=StopReason.REPAIR_ATTEMPTS_EXCEEDED,
+                            repair_attempts=repair_attempts,
+                        )
+                    # - 调用恢复规划器生成恢复动作。
+                    # - 如果返回 None（没有对应恢复策略），直接终止任务，标记为修复次数超限。
+                    # - 设计考量：无法自动恢复的故障，没必要继续消耗资源，直接终止，交给上层处理。
+                    recovery_action=self.recovery.plan(action,result)
+                    if recovery_action is None:
+                        reason = "no recovery action available"
+                        if trace:
+                            trace.record(
+                                TraceEventType.ERROR,
+                                step_index=steps,
+                                error=reason,
+                            )
+                        return AgentRunResult(
+                            success=False,
+                            final_output="",
+                            steps=steps,
+                            tool_calls=tool_calls,
+                            trace_id=trace.trace_id if trace else None,
+                            error=reason,
+                            tokens_used=tokens_used,
+                            elapsed_ms=int(
+                                (time.perf_counter() - started_at) * 1000
+                            ),
+                            stop_reason=StopReason.REPAIR_ATTEMPTS_EXCEEDED,
+                            repair_attempts=repair_attempts,
+                        )
+
+                    # - 自动执行恢复动作，走的是同一个工具注册器（带追踪的也会自动埋点）。
+                    # - 工具调用计数器 +1，恢复动作属于工具调用，计入总调用数预算。
+                    # - 关键：**这一步不消耗 Policy 决策步数**，是在当前 step 内自动完成的，相当于一步里做了「失败工具 + 恢复工具」两次工具调用，但只算一步决策。
+                    recovery_result=tools.call(
+                        recovery_action.action.value,
+                        **recovery_action.arguments,
+                    )
+                    tool_calls+=1
+
+                    # - 用恢复动作的输出更新 observation，作为下一轮 Policy 决策的观察信息。
+                    # - 恢复动作如果有错误，也追加到观察里。
+                    # - 向历史记录追加一条恢复动作的摘要，标记是恢复操作，和正常决策动作区分开。
+                    # > 设计亮点：恢复动作完全在循环内部自动完成，对 Policy 透明。Policy 下一轮拿到的就是已经恢复好的最新观察信息，不用自己决策去定位，节省了一步决策成本。
+                    observation=recovery_result.output
+                    if recovery_result.error:
+                        observation=f"{observation}\nERROR:\n{recovery_result.error}"
+
+                    history.append(
+                        f"recovery={recovery_action.action.value} "
+                        f"ok={recovery_result.ok}"
+                    )
+
+                    
 
             # 8.10 步数超限退出
             reason = "max steps reached"
@@ -442,6 +588,7 @@ class AgentLoop:
                 tokens_used=tokens_used,
                 elapsed_ms=int((time.perf_counter() - started_at) * 1000),
                 stop_reason=StopReason.MAX_STEPS,
+                repair_attempts=repair_attempts
             )
         # 8.11 全局异常捕获
         # - 捕获循环过程中所有未处理的异常，保证 Agent 不会崩溃。
@@ -465,7 +612,8 @@ class AgentLoop:
                 error=str(exc),
                 tokens_used=tokens_used,
                 elapsed_ms=int((time.perf_counter() - started_at) * 1000),
-                stop_reason=StopReason.ERROR
+                stop_reason=StopReason.ERROR,
+                repair_attempts=repair_attempts
             )
                 
 
