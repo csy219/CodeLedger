@@ -122,6 +122,7 @@ class AgentConfig:
     max_wall_time_seconds: float = 600.0
     max_repeated_actions: int = 2
     max_repair_attempts:int=2
+    finish_on_test_pass: bool = True
 
 
 
@@ -257,10 +258,12 @@ class AgentLoop:
     )->AgentRunResult:
         # - `started_at = time.perf_counter()`：记录任务开始的高精度时间戳，用于计算总耗时和时间预算检查。
         # - `tokens_used = 0`：初始化累计 token 消耗计数器。
-        # - `action_counts: dict[str, int] = {}`：初始化动作次数字典，key 是动作指纹，value 是出现次数，用于重复动作检测。
+        # - `last_action_signature` / `consecutive_action_count`：只统计连续重复动作。
+        #   这样“改代码后再跑一次同样的测试”不会被误判为死循环。
         started_at = time.perf_counter()
         tokens_used = 0
-        action_counts: dict[str, int] = {}
+        last_action_signature: str | None = None
+        consecutive_action_count = 0
 
         
         # 第一步：解析工作目录绝对路径。
@@ -361,10 +364,14 @@ class AgentLoop:
                 # - 在计数字典里对应计数 +1。
                 # - 如果超过最大重复次数，立刻终止，停止原因标记为 `REPEATED_ACTION`。
                 # 设计作用：Agent 有时候会陷入「读文件 → 没看懂 → 再读一遍」的死循环，重复动作检测能及时终止这种无意义的循环，避免浪费时间和成本。
-                signature=action.signature()
-                action_counts[signature]=action_counts.get(signature,0)+1
+                signature = action.signature()
+                if signature == last_action_signature:
+                    consecutive_action_count += 1
+                else:
+                    last_action_signature = signature
+                    consecutive_action_count = 1
 
-                if action_counts[signature] > self.config.max_repeated_actions:
+                if consecutive_action_count > self.config.max_repeated_actions:
                     reason = "repeated action limit reached"
                     if trace:
                         trace.record(
@@ -488,6 +495,37 @@ class AgentLoop:
                             "ok": result.ok,
                         },
                     )
+
+                # 本地测试全部通过后，直接结束，避免模型反复检查同一个 diff。
+                if (
+                    self.config.finish_on_test_pass
+                    and action.action == ActionType.RUN_TESTS
+                    and result.ok
+                ):
+                    final_output = "tests passed"
+                    if trace:
+                        trace.record(
+                            TraceEventType.RUN_FINISHED,
+                            step_index=steps,
+                            data={
+                                "success": True,
+                                "final_output": final_output,
+                            },
+                        )
+                    return AgentRunResult(
+                        success=True,
+                        final_output=final_output,
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        trace_id=trace.trace_id if trace else None,
+                        tokens_used=tokens_used,
+                        elapsed_ms=int(
+                            (time.perf_counter() - started_at) * 1000
+                        ),
+                        stop_reason=StopReason.FINISHED,
+                        repair_attempts=repair_attempts,
+                    )
+
                 # 八、核心改动：工具执行后的自动恢复逻辑
                 # 先判断工具执行是否失败。只有失败才会进入恢复流程，成功直接进入下一轮决策。
                 if not result.ok:
